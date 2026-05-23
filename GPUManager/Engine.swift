@@ -148,6 +148,7 @@ class Engine: ObservableObject {
     let pollInterval: TimeInterval = 1.0
     let ollamaActiveThreshold: Double = 0.50
     let processSuspendThreshold: Double = 0.05
+    let processDisplayThreshold: Double = 0.0005
     let cooldownThreshold: Double = 0.30
     let cooldownDuration: TimeInterval = 30.0
     let stopTimeout: TimeInterval = 10.0
@@ -334,7 +335,9 @@ class Engine: ObservableObject {
                 }
 
                 DispatchQueue.main.async {
-                    self.processes = infos.sorted { $0.gpuUsage > $1.gpuUsage }
+                    self.processes = infos
+                        .filter { $0.gpuUsage >= self.processDisplayThreshold }
+                        .sorted { $0.gpuUsage > $1.gpuUsage }
                     self.totalGPUUsage = total
                     self.ollamaGPUUsage = ollama
                     self.lastPollTime = Date()
@@ -409,7 +412,9 @@ class Engine: ObservableObject {
         }
 
         DispatchQueue.main.async {
-            self.processes = activeProcesses.sorted { $0.gpuUsage > $1.gpuUsage }
+            self.processes = activeProcesses
+                .filter { $0.gpuUsage > self.processDisplayThreshold }
+                .sorted { $0.gpuUsage > $1.gpuUsage }
             self.ollamaGPUUsage = ollamaTotal
             self.totalGPUUsage = totalGPU
             self.lastPollTime = Date()

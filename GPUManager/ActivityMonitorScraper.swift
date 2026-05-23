@@ -2,6 +2,7 @@ import Foundation
 #if canImport(AppKit)
 import AppKit
 import ApplicationServices
+import Darwin
 
 private var _lastAXTrustLogState: Bool? = nil
 
@@ -31,9 +32,13 @@ public enum ActivityMonitorScraperError: Error, LocalizedError {
 public final class ActivityMonitorScraper {
     public init() {}
 
+    public static var executablePath: String {
+        Bundle.main.executableURL?.path ?? (CommandLine.arguments.first ?? "<unknown>")
+    }
+
     public static var trustStatusDescription: String {
         let trusted = AXIsProcessTrusted()
-        let procPath = Bundle.main.executableURL?.path ?? (CommandLine.arguments.first ?? "<unknown>")
+        let procPath = executablePath
         let bundlePath = Bundle.main.bundleURL.path
         return "AX trusted=\(trusted) exec=\(procPath) bundle=\(bundlePath)"
     }
@@ -96,6 +101,16 @@ public final class ActivityMonitorScraper {
         throw ActivityMonitorScraperError.appNotFoundOrLaunched
     }
 
+    public func activityMonitorUITreeDiagnostics(maxDepth: Int = 4) -> String {
+        do {
+            _ = axDiagnostics(prefix: "[UI Tree]")
+            let appAX = try activityMonitorAppElement()
+            return buildUITreeDiagnostics(of: appAX, maxDepth: maxDepth)
+        } catch {
+            return "Activity Monitor UI Tree unavailable: \(error.localizedDescription)"
+        }
+    }
+
     public func scrapeProcesses() throws -> [ScrapedProcess] {
         _ = axDiagnostics(prefix: "[Scrape]")
         let appAX = try activityMonitorAppElement()
@@ -123,43 +138,21 @@ public final class ActivityMonitorScraper {
             NSLog("[AXHint] Using AXOutline as process list container")
         }
 
-        // Fetch column titles and indices
         let titles = fetchColumnTitles(from: listContainer)
-        let pidIndex = indexOfColumn(in: titles, matchingAnyOf: ["PID", "Process ID"]) // en variants
-        let nameIndex = indexOfColumn(in: titles, matchingAnyOf: ["Process Name", "Name"]) // en variants
-        let gpuIndex = indexOfColumn(in: titles, matchingAnyOf: ["GPU", "GPU Usage", "GPU %"]) // best-effort
-
-        // Fetch rows
-        guard let rows = attributeArray(listContainer, kAXRowsAttribute as CFString) ?? attributeArray(listContainer, kAXChildrenAttribute as CFString) else { return [] }
-
-        var results: [ScrapedProcess] = []
-        results.reserveCapacity(rows.count)
-
-        for row in rows {
-            guard let cells = attributeArray(row, kAXChildrenAttribute as CFString) else { continue }
-
-            let name = nameIndex.flatMap { cellStringValue(cells, index: $0) } ?? ""
-            let pidStr = pidIndex.flatMap { cellStringValue(cells, index: $0) } ?? ""
-            let gpuStr = gpuIndex.flatMap { cellStringValue(cells, index: $0) }
-
-            guard let pid = Int(pidStr) else { continue }
-
-            let gpuUsage: Double?
-            if let g = gpuStr {
-                let digits = g.replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespaces)
-                if let pct = Double(digits) {
-                    gpuUsage = max(0, min(1, pct / 100.0))
-                } else {
-                    gpuUsage = nil
-                }
-            } else {
-                gpuUsage = nil
-            }
-
-            results.append(ScrapedProcess(pid: pid, name: name, gpuUsage: gpuUsage))
+        let rows = fetchRows(from: listContainer)
+        if rows.isEmpty {
+            NSLog("[AXHint] Found process list container but no rows")
+            dumpSubtree(listContainer, depth: 0, maxDepth: 3)
+            return []
         }
 
-        return results
+        let processes = rows.compactMap { parseProcessRow($0, columnTitles: titles) }
+        if processes.isEmpty {
+            NSLog("[AXHint] Found \(rows.count) row(s), but none parsed as process stats")
+            dumpSubtree(listContainer, depth: 0, maxDepth: 3)
+        }
+
+        return processes
     }
 
     // MARK: - AX Helpers
@@ -206,6 +199,42 @@ public final class ActivityMonitorScraper {
         return nil
     }
 
+    private func fetchRows(from container: AXUIElement) -> [AXUIElement] {
+        let rowAttributes: [CFString] = [
+            kAXRowsAttribute as CFString,
+            "AXVisibleRows" as CFString,
+            kAXChildrenAttribute as CFString
+        ]
+
+        for attribute in rowAttributes {
+            guard let elements = attributeArray(container, attribute), !elements.isEmpty else { continue }
+            let rows = elements.flatMap { rowCandidates(from: $0) }
+            if !rows.isEmpty { return rows }
+        }
+
+        return []
+    }
+
+    private func rowCandidates(from element: AXUIElement) -> [AXUIElement] {
+        let role = axRole(of: element)
+        if role == String(kAXRowRole) {
+            return [element]
+        }
+
+        guard let children = attributeArray(element, kAXChildrenAttribute as CFString) else {
+            return role == String(kAXGroupRole) && !rowTextValues(from: element).isEmpty ? [element] : []
+        }
+
+        let childRows = children.flatMap { rowCandidates(from: $0) }
+        if !childRows.isEmpty { return childRows }
+
+        if role == String(kAXGroupRole), !rowTextValues(from: element).isEmpty {
+            return [element]
+        }
+
+        return []
+    }
+
     private func fetchColumnTitles(from table: AXUIElement) -> [String] {
         var titles: [String] = []
         if let columns = attributeArray(table, kAXColumnsAttribute as CFString) {
@@ -223,34 +252,111 @@ public final class ActivityMonitorScraper {
     }
 
     private func indexOfColumn(in titles: [String], matchingAnyOf candidates: [String]) -> Int? {
-        for (i, t) in titles.enumerated() {
-            for c in candidates {
-                if t.caseInsensitiveCompare(c) == .orderedSame {
-                    return i
-                }
+        let normalizedTitles = titles.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+        for (index, title) in normalizedTitles.enumerated() {
+            if candidates.contains(where: { title.caseInsensitiveCompare($0) == .orderedSame }) {
+                return index
             }
         }
+
+        for (index, title) in normalizedTitles.enumerated() {
+            if candidates.contains(where: { title.localizedCaseInsensitiveContains($0) }) {
+                return index
+            }
+        }
+
         return nil
     }
 
-    private func cellStringValue(_ cells: [AXUIElement], index: Int) -> String? {
-        guard cells.indices.contains(index) else { return nil }
-        var value: CFTypeRef?
-        if AXUIElementCopyAttributeValue(cells[index], kAXValueAttribute as CFString, &value) == .success,
-           let s = value as? String {
-            return s
+    private func parseProcessRow(_ row: AXUIElement, columnTitles: [String]) -> ScrapedProcess? {
+        let values = rowTextValues(from: row)
+        guard !values.isEmpty else { return nil }
+
+        if let process = parseProcessRowByColumns(values, columnTitles: columnTitles) {
+            return process
         }
-        // Fallback: check children for static text values
-        if let kids = attributeArray(cells[index], kAXChildrenAttribute as CFString) {
-            for k in kids {
-                var v: CFTypeRef?
-                if AXUIElementCopyAttributeValue(k, kAXValueAttribute as CFString, &v) == .success,
-                   let s = v as? String {
-                    return s
+
+        return parseProcessRowByInference(values)
+    }
+
+    private func parseProcessRowByColumns(_ values: [String], columnTitles: [String]) -> ScrapedProcess? {
+        guard !columnTitles.isEmpty else { return nil }
+        let pidIndex = indexOfColumn(in: columnTitles, matchingAnyOf: ["PID", "Process ID"])
+        let nameIndex = indexOfColumn(in: columnTitles, matchingAnyOf: ["Process Name", "Name"])
+        let gpuIndex = indexOfColumn(in: columnTitles, matchingAnyOf: ["GPU", "GPU Usage", "GPU %", "% GPU"])
+
+        guard let pid = pidIndex.flatMap({ value(at: $0, in: values) }).flatMap(parsePID) else { return nil }
+        let name = nameIndex.flatMap { value(at: $0, in: values) } ?? inferProcessName(from: values, pid: pid)
+        let gpuUsage = gpuIndex.flatMap { value(at: $0, in: values) }.flatMap(parseGPUUsage)
+
+        return ScrapedProcess(pid: pid, name: name, gpuUsage: gpuUsage)
+    }
+
+    private func parseProcessRowByInference(_ values: [String]) -> ScrapedProcess? {
+        let pidCandidates = values.compactMap(parsePID)
+        guard let pid = pidCandidates.first(where: processExists) ?? pidCandidates.last else { return nil }
+
+        let name = inferProcessName(from: values, pid: pid)
+        let gpuUsage = values.compactMap(parseGPUUsage).last
+        return ScrapedProcess(pid: pid, name: name, gpuUsage: gpuUsage)
+    }
+
+    private func rowTextValues(from element: AXUIElement) -> [String] {
+        var values: [String] = []
+        collectTextValues(from: element, into: &values)
+        return values
+    }
+
+    private func collectTextValues(from element: AXUIElement, into values: inout [String]) {
+        for attribute in [kAXValueAttribute as CFString, kAXTitleAttribute as CFString, kAXDescriptionAttribute as CFString] {
+            if let value = axStringAttr(element, attribute) {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty && values.last != trimmed {
+                    values.append(trimmed)
                 }
             }
         }
-        return nil
+
+        if let children = attributeArray(element, kAXChildrenAttribute as CFString) {
+            for child in children {
+                collectTextValues(from: child, into: &values)
+            }
+        }
+    }
+
+    private func value(at index: Int, in values: [String]) -> String? {
+        guard values.indices.contains(index) else { return nil }
+        return values[index]
+    }
+
+    private func parsePID(_ value: String) -> Int? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.contains("%") else { return nil }
+
+        let digitsOnly = trimmed.filter { $0.isNumber }
+        guard !digitsOnly.isEmpty, trimmed.allSatisfy({ $0.isNumber || $0 == "," }) else { return nil }
+        guard let pid = Int(digitsOnly), pid > 0 else { return nil }
+        return pid
+    }
+
+    private func processExists(_ pid: Int) -> Bool {
+        guard pid <= Int32.max else { return false }
+        let result = kill(pid_t(pid), 0)
+        return result == 0 || errno == EPERM
+    }
+
+    private func parseGPUUsage(_ value: String) -> Double? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let numeric = trimmed.replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let percent = Double(numeric), percent >= 0, percent <= 100 else { return nil }
+        return percent / 100.0
+    }
+
+    private func inferProcessName(from values: [String], pid: Int) -> String {
+        return values.first { value in
+            parsePID(value) != pid && parsePID(value) == nil && parseGPUUsage(value) == nil
+        } ?? "<unknown>"
     }
 
     // MARK: - Diagnostics Helpers
@@ -262,6 +368,42 @@ public final class ActivityMonitorScraper {
             return s
         }
         return nil
+    }
+
+    private func buildUITreeDiagnostics(of app: AXUIElement, maxDepth: Int) -> String {
+        var lines: [String] = []
+        if let windows = attributeArray(app, kAXWindowsAttribute as CFString) {
+            lines.append("Found \(windows.count) Activity Monitor window(s)")
+            for (index, window) in windows.enumerated() {
+                let role = axRole(of: window) ?? "<nil>"
+                let title = axStringAttr(window, kAXTitleAttribute as CFString) ?? "<no title>"
+                lines.append("Window[\(index)]: role=\(role) title=\(title)")
+                appendSubtree(window, to: &lines, depth: 1, maxDepth: maxDepth)
+            }
+        } else {
+            lines.append("No Activity Monitor windows attribute")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func appendSubtree(_ element: AXUIElement, to lines: inout [String], depth: Int, maxDepth: Int) {
+        guard depth <= maxDepth else { return }
+        let role = axRole(of: element) ?? "<nil>"
+        let title = axStringAttr(element, kAXTitleAttribute as CFString) ?? ""
+        let value = axStringAttr(element, kAXValueAttribute as CFString) ?? ""
+        let indent = String(repeating: "  ", count: depth)
+
+        if !title.isEmpty || !value.isEmpty {
+            lines.append("\(indent)- role=\(role) title=\(title) value=\(value)")
+        } else {
+            lines.append("\(indent)- role=\(role)")
+        }
+
+        if let children = attributeArray(element, kAXChildrenAttribute as CFString) {
+            for child in children {
+                appendSubtree(child, to: &lines, depth: depth + 1, maxDepth: maxDepth)
+            }
+        }
     }
 
     private func dumpWindows(of app: AXUIElement) {

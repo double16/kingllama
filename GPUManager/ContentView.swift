@@ -216,9 +216,7 @@ struct ContentView: View {
                     .font(.headline)
                 Spacer()
                 Button("Copy Diagnostics") {
-                    let summary = buildDiagnosticsSummary()
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(summary, forType: .string)
+                    copyToClipboard(buildDiagnosticsSummary())
                 }
                 .buttonStyle(.bordered)
             }
@@ -232,6 +230,10 @@ struct ContentView: View {
                         .font(.caption2)
                         .foregroundColor(.secondary)
                         .lineLimit(2)
+                        .help("Click to copy executable path")
+                        .onTapGesture {
+                            copyToClipboard(ActivityMonitorScraper.executablePath)
+                        }
                 }
                 #endif
 
@@ -316,6 +318,11 @@ struct ContentView: View {
         .padding(.bottom, 8)
     }
 
+    private func copyToClipboard(_ string: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(string, forType: .string)
+    }
+
     private func buildDiagnosticsSummary() -> String {
         var lines: [String] = []
         lines.append("Resolved Path: \(engine.diagResolvedPath ?? "—")")
@@ -325,6 +332,11 @@ struct ContentView: View {
         lines.append("Tried Paths: \(triedPaths)")
         let triedSyms = engine.diagTriedSymbols.isEmpty ? "—" : engine.diagTriedSymbols.joined(separator: ", ")
         lines.append("Tried Symbols: \(triedSyms)")
+        #if canImport(AppKit)
+        lines.append("")
+        lines.append("Activity Monitor UI Tree:")
+        lines.append(ActivityMonitorScraper().activityMonitorUITreeDiagnostics())
+        #endif
         return lines.joined(separator: "\n")
     }
 }
