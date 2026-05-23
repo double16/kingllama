@@ -342,10 +342,10 @@ class Engine: ObservableObject {
                     self.ollamaGPUUsage = ollama
                     self.lastPollTime = Date()
                     self.suspendedCount = self.suspendedProcesses.count
-                }
 
-                // Decision logic using scraped data (no taskRepresentation available)
-                self.evaluateGPUState(ollamaGPU: ollama, highUsageProcesses: [])
+                    // Decision logic can publish manager state, so keep it on the main thread.
+                    self.evaluateGPUState(ollamaGPU: ollama, highUsageProcesses: [])
+                }
             } catch {
                 self.addLog("Activity Monitor scraping failed: \(error.localizedDescription)", level: .error)
             }
@@ -419,13 +419,13 @@ class Engine: ObservableObject {
             self.totalGPUUsage = totalGPU
             self.lastPollTime = Date()
             self.suspendedCount = self.suspendedProcesses.count
-        }
 
-        // Decision logic
-        evaluateGPUState(
-            ollamaGPU: ollamaTotal,
-            highUsageProcesses: highUsageNonOllama
-        )
+            // Decision logic can publish manager state, so keep it on the main thread.
+            self.evaluateGPUState(
+                ollamaGPU: ollamaTotal,
+                highUsageProcesses: highUsageNonOllama
+            )
+        }
     }
 
     // MARK: Decision Logic
