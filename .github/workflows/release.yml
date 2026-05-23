@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: KingLlama
+  PROJECT_PATH: KingLlama.xcodeproj
+  SCHEME: KingLlama
+  CONFIGURATION: Release
+
+jobs:
+  build:
+    name: Build macOS App
+    runs-on: macos-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build app
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -destination "generic/platform=macOS" \
+            -configuration "$CONFIGURATION" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package app
+        run: |
+          set -euo pipefail
+
+          app_path="build/DerivedData/Build/Products/$CONFIGURATION/$APP_NAME.app"
+          version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app_path/Contents/Info.plist")
+          build_number=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$app_path/Contents/Info.plist")
+
+          mkdir -p dist
+          ref_name="${GITHUB_REF_NAME:-manual}"
+          safe_ref_name="${ref_name//\//-}"
+          archive_name="$APP_NAME-$safe_ref_name.zip"
+          ditto -c -k --keepParent "$app_path" "dist/$archive_name"
+
+          {
+            echo "archive_name=$archive_name"
+            echo "version=$version"
+            echo "build_number=$build_number"
+          } >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KingLlama-macOS
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Attach artifact to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          tag_name="$GITHUB_REF_NAME"
+          archive_path="dist/$archive_name"
+          release_notes="Automated KingLlama macOS build.
+
+          Version: $version
+          Build: $build_number"
+
+          if gh release view "$tag_name" >/dev/null 2>&1; then
+            gh release upload "$tag_name" "$archive_path" --clobber
+          else
+            gh release create "$tag_name" "$archive_path" \
+              --title "$tag_name" \
+              --notes "$release_notes"
+          fi
