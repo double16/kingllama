@@ -2,7 +2,7 @@
 
 A macOS app to give local models all the GPU.
 
-![logo](logo.png)
+![logo](GPUManager/Resources/Assets.xcassets/AppIcon.appiconset/icon_256.png)
 
 Many programs are using GPU: browsers, Apple services, etc. When you run a local
 model using Ollama, Llama.cpp, etc., you want all the GPU! This app will monitor
